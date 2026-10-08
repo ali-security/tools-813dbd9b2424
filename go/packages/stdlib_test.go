@@ -6,6 +6,7 @@ package packages_test
 
 import (
 	"bytes"
+	"go/build"
 	"io/ioutil"
 	"path/filepath"
 	"runtime"
@@ -60,6 +61,16 @@ func TestStdlibMetadata(t *testing.T) {
 func TestCgoOption(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping in short mode; uses tons of memory (https://golang.org/issue/14113)")
+	}
+	// On windows the net package does not use cgo, so net.cgoLookupHost
+	// is not defined and the lookup below fails.
+	if runtime.GOOS == "windows" {
+		t.Skipf("no cgo net/os/user implementation on %s", runtime.GOOS)
+	}
+	// In nocgo builds (CGO_ENABLED=0) go list selects the pure Go
+	// files, so the native implementations checked below are absent.
+	if !build.Default.CgoEnabled {
+		t.Skip("skipping in nocgo build (CGO_ENABLED=0)")
 	}
 
 	// TODO(adonovan): see if we can get away without these old

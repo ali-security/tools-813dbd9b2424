@@ -1,0 +1,175 @@
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Run only selected Go packages/tests (go test arguments, e.g. './godoc/... -run TestFoo'); empty runs ./..."
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+
+      - name: Build module zip helper
+        run: |
+          set -euo pipefail
+          HELPER=$(mktemp -d)
+          cp "$GITHUB_WORKSPACE/.github/create_mod.go" "$HELPER/"
+          cd "$HELPER"
+          go mod init example.com/mod
+          go get golang.org/x/mod@v0.24.0
+          go build -o "$RUNNER_TEMP/create_mod" .
+
+      - name: Stage module source
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/zipsrc"
+          tar -c --exclude=.git --exclude=.github -C "$GITHUB_WORKSPACE" . | tar -x -C "$RUNNER_TEMP/zipsrc"
+          test ! -e "$RUNNER_TEMP/zipsrc/.github"
+          test -f "$RUNNER_TEMP/zipsrc/go.mod"
+
+      - name: Create module zip
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          "$RUNNER_TEMP/create_mod" golang.org/x/tools v0.0.0-20190312170243-e65039ee4138 \
+            "$RUNNER_TEMP/zipsrc" "$RUNNER_TEMP/out/v0.0.0-20190312170243-e65039ee4138.zip"
+          ls -l "$RUNNER_TEMP/out"
+
+      - name: Check module zip entry count
+        run: |
+          set -euo pipefail
+          # The public proxy zip for this version has 1023 entries.
+          count=$(unzip -Z1 "$RUNNER_TEMP/out/v0.0.0-20190312170243-e65039ee4138.zip" | wc -l)
+          echo "module zip entries: $count (expected 1023)"
+          test "$count" -eq 1023
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.0.0-20190312170243-e65039ee4138.zip
+          if-no-files-found: error
+
+  test:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            go: "1.12.17"
+            arch: x64
+            cgo: "1"
+          - os: windows-latest
+            go: "1.12.17"
+            arch: x64
+            cgo: "1"
+          # macos-latest is macOS 15+, whose dyld rejects binaries linked without
+          # LC_UUID (Go < 1.23), and Go < 1.16 has no darwin/arm64 build. Go 1.16
+          # cannot load this 2019 code (iexport v1 export data, newer go list
+          # output, new vet checks), so run darwin/amd64 Go 1.12 under Rosetta
+          # on macOS 14, which still accepts binaries without LC_UUID.
+          # cgo is off here: Go 1.12's cgo cannot parse the DWARF the current
+          # Xcode clang emits ("malformed DWARF TagVariable entry" building
+          # crypto/x509's root_cgo_darwin.go); cgo stays covered on linux/windows.
+          - os: macos-14
+            go: "1.12.17"
+            arch: x64
+            cgo: "0"
+    defaults:
+      run:
+        shell: bash
+    env:
+      GO111MODULE: "on"
+      GOPROXY: https://proxy.golang.org
+      GOFLAGS: ""
+      CGO_ENABLED: ${{ matrix.cgo }}
+    steps:
+      - name: Disable autocrlf
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          architecture: ${{ matrix.arch }}
+          cache: false
+
+      # Go 1.12's prebuilt runtime/cgo needs __iob_func, which the runner's UCRT
+      # gcc lacks; cmd/stringer TestEndToEnd builds a cgo file.
+      - name: Install msvcrt mingw gcc (windows)
+        if: runner.os == 'Windows'
+        run: |
+          set -euo pipefail
+          choco install mingw --version 8.1.0 -y --no-progress
+          echo 'C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin' >> "$GITHUB_PATH"
+
+      - name: Check mingw gcc version (windows)
+        if: runner.os == 'Windows'
+        run: |
+          set -euo pipefail
+          which gcc
+          gcc --version | grep -F 8.1.0
+
+      - name: Point TEMP/TMP at runner temp (windows)
+        if: runner.os == 'Windows'
+        run: |
+          set -euo pipefail
+          echo "TEMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
+          echo "TMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Go version
+        run: go version
+
+      - name: Go env
+        run: go env
+
+      # On windows cmd/splitdwarf keeps only doc.go (splitdwarf.go is tagged
+      # !windows), so the main package has no main func and cannot link.
+      - name: Build
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            go build $(go list ./... | grep -v '/cmd/splitdwarf$')
+          else
+            go build ./...
+          fi
+
+      # -p 1: cmd/godoc TestWebIndex waits only 2m for the search index and
+      # times out under parallel package load.
+      - name: Test
+        run: |
+          set -euo pipefail
+          go test -p 1 -v ${{ inputs.test-filter || './...' }} 2>&1 | tee "$RUNNER_TEMP/go-test.log"
+
+      - name: Test summary
+        if: always()
+        run: |
+          set -euo pipefail
+          test -f "$RUNNER_TEMP/go-test.log"
+          awk '
+            /^[ \t]*--- PASS/ { pass++ }
+            /^[ \t]*--- FAIL/ { fail++ }
+            /^[ \t]*--- SKIP/ { skip++ }
+            /^ok[ \t]/ { okpkg++ }
+            /^FAIL/ { failpkg++ }
+            END {
+              printf "TEST SUMMARY: pass=%d fail=%d skip=%d ok_packages=%d fail_packages=%d\n", pass, fail, skip, okpkg, failpkg
+            }
+          ' "$RUNNER_TEMP/go-test.log"

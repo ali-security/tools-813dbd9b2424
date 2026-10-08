@@ -29,6 +29,17 @@ import (
 // for versions of go list before Go 1.10.4.
 var usesOldGolist = false
 
+func TestMain(m *testing.M) {
+	// On windows the Go 1.12 go command intermittently fails module-mode
+	// go list runs in the fake module trees (no file-lock retries before
+	// Go 1.13), failing a different Modules subtest on each run. Exercise
+	// only the GOPATH exporter there; Modules runs on the other platforms.
+	if runtime.GOOS == "windows" {
+		packagestest.All = []packagestest.Exporter{packagestest.GOPATH}
+	}
+	os.Exit(m.Run())
+}
+
 // TODO(adonovan): more test cases to write:
 //
 // - When the tests fail, make them print a 'cd & load' command
@@ -803,7 +814,7 @@ func testParseFileModifyAST(t *testing.T, exporter packagestest.Exporter) {
 	}
 	initial, err := packages.Load(exported.Config, "golang.org/fake/a")
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
 
 	// Check value of a.A has been set to "b"
